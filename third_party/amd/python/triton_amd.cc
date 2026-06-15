@@ -555,9 +555,28 @@ void init_triton_amd(py::module &&m) {
     mlir::triton::AMD::runScalarizePackedFOpsPass(*fn);
   });
 
+  m.def("add_pack_fops_llvm_pass", [](llvm::Function *fn) {
+    mlir::triton::AMD::runPackFOpsPass(*fn);
+  });
+
+  m.def("add_attn_fwd_schedule_pass",
+        [](llvm::Function *fn, const std::string &arch) {
+          mlir::triton::AMD::runAttnFwdSchedulePass(*fn, arch);
+        });
+
   m.def("add_llir_schedule_pass",
         [](llvm::Function *fn, const std::string &arch) {
           mlir::triton::AMD::runLLIRSchedulePass(*fn, arch);
+        });
+
+  m.def("add_attn_schedule_pass",
+        [](llvm::Function *fn, const std::string &arch) {
+          mlir::triton::AMD::runAttnSchedulePass(*fn, arch);
+        });
+
+  m.def("add_attn_bwd_schedule_pass",
+        [](llvm::Function *fn, const std::string &arch) {
+          mlir::triton::AMD::runAttnBwdSchedulePass(*fn, arch);
         });
 
   auto hipBlas = m.def_submodule("hipblas");

@@ -4,6 +4,7 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include <cstdlib>
 
 namespace mlir::triton::AMD {
 namespace {
@@ -52,6 +53,24 @@ bool filterAsyncLocalLoadsDependencies(Operation *op1, Operation *op2,
          isLocalLoadWithAsyncWaitToken(op2);
 }
 
+// Returns true if both operands are async loads (cp.async / buffer_load_to_lds).
+// Two async-DMA writes are ordered by the async queue and commit/wait tokens, so
+// a CTA-wide barrier between them is redundant (matches autopipeliner output).
+// Gated by env var so the behavior is opt-in and A/B testable.
+bool filterAsyncVsAsyncDependencies(Operation *op1, Operation *op2) {
+  // Read each call (no static cache) so a kernel launcher can scope it via
+  // os.environ around its own compile without affecting other kernels.
+  const char *e = std::getenv("TRITON_AMD_MEMBAR_SKIP_ASYNC_ASYNC");
+  if (!(e && e[0] == '1'))
+    return false;
+  auto isAsyncLoad = [](Operation *op) {
+    return llvm::isa<triton::gpu::AsyncCopyGlobalToLocalOp,
+                     triton::amdgpu::BufferLoadToLocalOp,
+                     triton::amdgpu::AsyncTDMCopyLocalToGlobalOp>(op);
+  };
+  return isAsyncLoad(op1) && isAsyncLoad(op2);
+}
+
 bool filterLDSMemoryBarriersDependencies(Operation *op1, Operation *op2) {
   auto isLDSMemoryBarrierOp = [](Operation *op) {
     return llvm::isa<triton::amdgpu::InitBarrierOp,
@@ -67,6 +86,7 @@ bool filterLDSMemoryBarriersDependencies(Operation *op1, Operation *op2) {
 bool membarFilter(Operation *op1, Operation *op2, bool /*op1IsRead*/,
                   bool /*op2IsRead*/, Allocation *allocation) {
   return (filterAsyncLocalLoadsDependencies(op1, op2, allocation) ||
+          filterAsyncVsAsyncDependencies(op1, op2) ||
           filterLDSMemoryBarriersDependencies(op1, op2));
 }
 } // namespace mlir::triton::AMD

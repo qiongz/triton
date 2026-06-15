@@ -364,7 +364,10 @@ std::string translateLLVMIRToASM(llvm::Module &module,
     }
   }
 
-  if (triton::tools::getBoolEnv("TRITON_ENABLE_LLIR_SCHED")) {
+  if (triton::tools::getBoolEnv("TRITON_ENABLE_LLIR_SCHED") ||
+      triton::tools::getBoolEnv("TRITON_ATTN_SCHED_NOMISCHED") ||
+      triton::tools::getBoolEnv("TRITON_ATTN_BWD_NOMISCHED") ||
+      triton::tools::getBoolEnv("TRITON_ATTN_FWD_NOMISCHED")) {
     { // Disable pre-RA misched
       auto options = llvm::cl::getRegisteredOptions();
       auto optIt = options.find("enable-misched");

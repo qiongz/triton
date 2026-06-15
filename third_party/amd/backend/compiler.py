@@ -502,8 +502,24 @@ class HIPBackend(BaseBackend):
         if knobs.amd.scalarize_packed_fops:
             amd.add_scalarize_packed_fops_llvm_pass(kernel_fn)
 
+        if os.environ.get("TRITON_ENABLE_PACK_FOPS"):
+            amd.add_pack_fops_llvm_pass(kernel_fn)
+
         if os.environ.get("TRITON_ENABLE_LLIR_SCHED"):
             amd.add_llir_schedule_pass(kernel_fn, options.arch)
+
+        # AttnBwd (LDS-read prefetch) runs BEFORE AttnSchedule (MFMA placement) so
+        # the latter interleaves MFMAs over the already-hoisted load order. Orthogonal
+        # + stackable; either can be enabled alone.
+        if os.environ.get("TRITON_ENABLE_ATTN_BWD_SCHED"):
+            amd.add_attn_bwd_schedule_pass(kernel_fn, options.arch)
+
+        if os.environ.get("TRITON_ENABLE_ATTN_SCHED"):
+            amd.add_attn_schedule_pass(kernel_fn, options.arch)
+
+        # forward-safe LDS-read prefetch (fence-aware): hoist ds_read to cut s_waitcnt
+        if os.environ.get("TRITON_ENABLE_ATTN_FWD_SCHED"):
+            amd.add_attn_fwd_schedule_pass(kernel_fn, options.arch)
 
         # Get some metadata
         metadata["num_warps"] = total_warps_num

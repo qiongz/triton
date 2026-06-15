@@ -1,5 +1,7 @@
 add_triton_library(TritonAMDGPUToLLVM
     AsyncUtility.cpp
+    PackFOps.cpp
+    AttnFwdSchedule.cpp
     AtomicRMWOpsEmitter.cpp
     AllocateSharedMemory.cpp
     PrepareConSanCaptures.cpp
@@ -18,6 +20,8 @@ add_triton_library(TritonAMDGPUToLLVM
     FuncOpToLLVM.cpp
     LoadStoreOpToLLVM.cpp
     LLIRSchedule.cpp
+    AttnSchedule.cpp
+    AttnBwdScheduling.cpp
     GCNAsmFormat.cpp
     HistogramOpToLLVM.cpp
     TritonGPUToLLVM.cpp

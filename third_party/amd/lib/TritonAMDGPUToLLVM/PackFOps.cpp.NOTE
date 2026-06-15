@@ -1,0 +1,9 @@
+PackFOps co-design result (gated TRITON_ENABLE_PACK_FOPS, default OFF):
+- Authored as the inverse of ScalarizePackedFOps to add v_pk_* for the attention rescale.
+- Built + verified correct (rel 0.005), ~30-47s incremental rebuild.
+- NO-OP for attention: the clean Gluon/recovered kernel ALREADY emits v_pk=171 (VectorCombine
+  vectorizes the rescale) -- MORE than aiter's 152. The earlier "v_pk=0" was an ATTN_SCHED=even
+  artifact (that pass reorders the BB and breaks the <2xf32> packing). hd128: 1004 -> 1002 (noop).
+- Corrected asm gap vs aiter is s_waitcnt (62 vs 22, ~8x more memory stalls per MFMA) + aiter's
+  larger per-kernel tile, NOT packed VALU. The lever is load/pipeline scheduling, not packing.
+- Pass left in tree, gated OFF; harmless. Kept as infra for future packing experiments.

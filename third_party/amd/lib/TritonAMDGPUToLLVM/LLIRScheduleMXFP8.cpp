@@ -1462,6 +1462,140 @@ struct LLIRSchedulePass : FunctionPass {
   }
 };
 
+// ---------------------------------------------------------------------------
+// MXFP8 dependency-preserving interleave (Phase 2).
+//
+// The stock positional scheduler relocates instructions assuming pure-GEMM /
+// loop-carried (PHI) MFMA operands; the microscaled-MFMA scale operand is a
+// <N x i8> built in-body by insertelement from PHI scale bytes, so positional
+// moves break SSA dominance. Instead we do a *list schedule* over the loop body:
+//   - memory / side-effecting ops keep their original relative order (never
+//     reorder a load/store/async/barrier/waitcnt past another);
+//   - an instruction is emitted only once all its in-block operands are emitted
+//     (SSA dominance preserved by construction -> always verifies);
+//   - MFMAs are woven among the memory ops at a target rate so the matrix unit
+//     is fed between loads (the interleave the scheduler exists to produce).
+// Returns true if it reordered BB.
+static bool interleaveLoopBBMXFP8(llvm::BasicBlock &BB, unsigned mfmaPerMem) {
+  using namespace llvm;
+  SmallVector<Instruction *, 256> orig;
+  bool hasMFMA = false;
+  for (Instruction &I : BB) {
+    if (isa<PHINode>(&I) || I.isTerminator())
+      continue;
+    orig.push_back(&I);
+    hasMFMA |= Utils::isMFMAorWMMA(I);
+  }
+  if (!hasMFMA || orig.size() < 4)
+    return false;
+
+  DenseMap<Instruction *, unsigned> idx;
+  for (unsigned i = 0; i < orig.size(); ++i)
+    idx[orig[i]] = i;
+
+  auto isMFMA = [](Instruction *I) { return Utils::isMFMAorWMMA(*I); };
+  auto isMem = [&](Instruction *I) {
+    if (isMFMA(I))
+      return false;
+    SchedKind k = Utils::classifySchedInst(*I);
+    if (k == SchedKind::GR || k == SchedKind::LR || k == SchedKind::LW)
+      return true;
+    return I->mayReadOrWriteMemory() || I->mayHaveSideEffects();
+  };
+
+  // unmet in-block operand counts
+  SmallVector<unsigned, 256> unmet(orig.size(), 0);
+  for (unsigned i = 0; i < orig.size(); ++i)
+    for (Value *op : orig[i]->operands())
+      if (auto *oi = dyn_cast<Instruction>(op)) {
+        auto it = idx.find(oi);
+        if (it != idx.end())
+          unmet[i]++;
+      }
+
+  SmallVector<bool, 256> emitted(orig.size(), false);
+  SmallVector<Instruction *, 256> sched;
+  sched.reserve(orig.size());
+  unsigned emittedCount = 0, mfmaRun = 0, memScan = 0;
+
+  auto emit = [&](unsigned i) {
+    emitted[i] = true;
+    sched.push_back(orig[i]);
+    emittedCount++;
+    for (User *u : orig[i]->users())
+      if (auto *ui = dyn_cast<Instruction>(u)) {
+        auto it = idx.find(ui);
+        if (it != idx.end() && !emitted[it->second] && unmet[it->second] > 0)
+          unmet[it->second]--;
+      }
+  };
+
+  while (emittedCount < orig.size()) {
+    bool progress = false;
+    // 1. drain ready non-mem, non-mfma (operand prep: converts, insertelement,
+    //    scale-vector build) so MFMAs become ready.
+    bool drained = true;
+    while (drained) {
+      drained = false;
+      for (unsigned i = 0; i < orig.size(); ++i)
+        if (!emitted[i] && unmet[i] == 0 && !isMem(orig[i]) && !isMFMA(orig[i])) {
+          emit(i);
+          drained = true;
+          progress = true;
+        }
+    }
+    // 2. weave ready MFMAs up to the target rate.
+    for (unsigned i = 0; i < orig.size() && mfmaRun < mfmaPerMem; ++i)
+      if (!emitted[i] && unmet[i] == 0 && isMFMA(orig[i])) {
+        emit(i);
+        mfmaRun++;
+        progress = true;
+      }
+    // 3. emit the next memory op (original relative order) if ready.
+    while (memScan < orig.size() &&
+           (emitted[memScan] || !isMem(orig[memScan])))
+      memScan++;
+    if (memScan < orig.size() && unmet[memScan] == 0) {
+      emit(memScan);
+      mfmaRun = 0;
+      progress = true;
+    }
+    if (!progress) {
+      // emit any ready instruction to avoid stalling (e.g. an MFMA past the rate
+      // when no memory op is ready yet).
+      bool any = false;
+      for (unsigned i = 0; i < orig.size(); ++i)
+        if (!emitted[i] && unmet[i] == 0) {
+          emit(i);
+          if (isMem(orig[i]))
+            mfmaRun = 0;
+          any = true;
+          break;
+        }
+      if (!any)
+        return false; // dependency cycle (unexpected) -> leave BB unchanged
+    }
+  }
+
+  // Physically reorder: place `sched` in order just before the terminator.
+  Instruction *term = BB.getTerminator();
+  for (Instruction *I : sched)
+    I->moveBefore(term->getIterator());
+
+  // Optional: pin the interleave against the LLVM backend machine scheduler with
+  // a full sched.barrier(0) before each memory op. NOTE: full barriers are too
+  // rigid for the current naive interleave (they out-rank the backend's own
+  // latency-aware scheduling and regress), so this is OFF by default
+  // (TRITON_LLIR_MXFP8_PIN=1 to experiment). A real win needs the interleave to
+  // match the HW feeds-and-speeds spacing first, then a finer-grained fence.
+  if (::getenv("TRITON_LLIR_MXFP8_PIN")) {
+    for (Instruction *I : sched)
+      if (isMem(I))
+        Utils::insertSchedBarrierBefore(I);
+  }
+  return true;
+}
+
 } // end anonymous namespace
 
 char LLIRSchedulePass::ID = 0;
@@ -1474,33 +1608,32 @@ namespace mlir::triton::AMD {
 // safety net for the microscaled-MFMA scale-vector PHI/insertelement structure
 // the stock pass cannot relocate without breaking SSA dominance.
 void runLLIRScheduleMXFP8Pass(llvm::Function &F, llvm::StringRef arch) {
-  // Bail-out-unchanged: schedule a clone first, commit to F only if it verifies.
-  // (Phase 1 safety net; the dependency-preserving microscale interleave is added
-  // on top so mxfp8 gets a valid, MFMA-interleaved schedule.)
-  {
-    llvm::ValueToValueMapTy VMap;
-    llvm::Function *Clone = llvm::CloneFunction(&F, VMap);
-    {
-      llvm::legacy::FunctionPassManager FPM(Clone->getParent());
-      FPM.add(new LLIRSchedulePass(arch));
-      FPM.doInitialization();
-      FPM.run(*Clone);
-      FPM.doFinalization();
-    }
-    bool valid = !llvm::verifyFunction(*Clone);
-    Clone->eraseFromParent();
-    if (!valid)
-      return; // leave F unscheduled (valid base order)
+  // Dependency-preserving list-schedule interleave of the loop body. MFMA-per-mem
+  // rate from TRITON_LLIR_MXFP8_RATE (default 2 ~ fp8 throughput). The interleave
+  // is SSA-safe by construction, but verify + revert-via-clone as a hard safety:
+  // if anything is off we leave F at its (valid) base order instead of asserting.
+  unsigned rate = 2;
+  if (const char *r = ::getenv("TRITON_LLIR_MXFP8_RATE"))
+    rate = std::max(1, atoi(r));
+
+  llvm::ValueToValueMapTy VMap;
+  llvm::Function *Clone = llvm::CloneFunction(&F, VMap);
+  bool changed = false;
+  for (llvm::BasicBlock &BB : *Clone)
+    changed |= interleaveLoopBBMXFP8(BB, rate);
+  bool valid = !changed || !llvm::verifyFunction(*Clone);
+  Clone->eraseFromParent();
+  if (!valid) {
+    llvm::errs() << "[LLIR-sched-mxfp8] interleave invalid for '" << F.getName()
+                 << "'; leaving base order.\n";
+    return;
   }
 
-  llvm::legacy::FunctionPassManager FPM(F.getParent());
-  FPM.add(new LLIRSchedulePass(arch));
-  FPM.doInitialization();
-  FPM.run(F);
-  FPM.doFinalization();
+  for (llvm::BasicBlock &BB : F)
+    interleaveLoopBBMXFP8(BB, rate);
 
   if (llvm::verifyFunction(F, &llvm::errs())) {
-    llvm::errs() << "LLIR schedule pass produced invalid IR!\n";
+    llvm::errs() << "LLIR mxfp8 schedule produced invalid IR!\n";
     assert(false && "expected function to verify successfully");
   }
 }

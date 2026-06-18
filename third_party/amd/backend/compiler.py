@@ -505,6 +505,9 @@ class HIPBackend(BaseBackend):
         if os.environ.get("TRITON_ENABLE_LLIR_SCHED"):
             amd.add_llir_schedule_pass(kernel_fn, options.arch)
 
+        if os.environ.get("TRITON_ENABLE_LLIR_SCHED_MXFP8"):
+            amd.add_llir_schedule_mxfp8_pass(kernel_fn, options.arch)
+
         # Get some metadata
         metadata["num_warps"] = total_warps_num
         metadata["shared"] = src.get_int_attr("ttg.shared")

@@ -18,6 +18,7 @@ add_triton_library(TritonAMDGPUToLLVM
     FuncOpToLLVM.cpp
     LoadStoreOpToLLVM.cpp
     LLIRSchedule.cpp
+    LLIRScheduleMXFP8.cpp
     GCNAsmFormat.cpp
     HistogramOpToLLVM.cpp
     TritonGPUToLLVM.cpp

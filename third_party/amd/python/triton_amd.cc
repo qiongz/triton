@@ -560,6 +560,11 @@ void init_triton_amd(py::module &&m) {
           mlir::triton::AMD::runLLIRSchedulePass(*fn, arch);
         });
 
+  m.def("add_llir_schedule_mxfp8_pass",
+        [](llvm::Function *fn, const std::string &arch) {
+          mlir::triton::AMD::runLLIRScheduleMXFP8Pass(*fn, arch);
+        });
+
   auto hipBlas = m.def_submodule("hipblas");
   // For ROCm installed via TheRock wheels: Preload hipblaslt library via
   // rocm_sdk if available. When using TheRock wheel installs, libhipblaslt

@@ -12,6 +12,7 @@
 #include "llvm/Pass.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 
 #define DEBUG_TYPE "tritonamdgpu-llir-schedule"
 
@@ -853,15 +854,28 @@ private:
         }
       }
     }
-    // Insert extra users right after their defining LR in the move list
+    // Insert extra users right after their defining LR in the move list.
+    // The defining LR is whichever operand of EU is in ToMove -- NOT necessarily
+    // operand 0 (a microscaled transpose-read convert can have a non-Instruction
+    // operand 0). cast<>(operand0) asserts on those; search operands with dyn_cast.
+    // Behavior is identical when operand 0 is the LR, so a4w4/a8w8/a16w16 unaffected.
     for (Instruction *EU : ExtraUsers) {
-      // Find the position: right after the LR that defines it
-      for (size_t j = 0; j < ToMove.size(); ++j) {
-        if (ToMove[j] == cast<Instruction>(EU->getOperand(0))) {
-          ToMove.insert(ToMove.begin() + j + 1, EU);
-          break;
+      size_t pos = ToMove.size();
+      for (Value *Op : EU->operands()) {
+        auto *OpI = dyn_cast<Instruction>(Op);
+        if (!OpI)
+          continue;
+        for (size_t j = 0; j < ToMove.size(); ++j) {
+          if (ToMove[j] == OpI) {
+            pos = j;
+            break;
+          }
         }
+        if (pos != ToMove.size())
+          break;
       }
+      if (pos != ToMove.size())
+        ToMove.insert(ToMove.begin() + pos + 1, EU);
     }
 
     if (ToMove.empty())
@@ -1455,6 +1469,29 @@ char LLIRSchedulePass::ID = 0;
 namespace mlir::triton::AMD {
 
 void runLLIRSchedulePass(llvm::Function &F, llvm::StringRef arch) {
+  // Bail-out-unchanged safety net: schedule a CLONE first and only commit to F if
+  // it verifies. Structures the positional scheduler can't safely handle (notably
+  // the microscaled-MFMA scale-vector PHI/insertelement packing, which it relocates
+  // across SSA dominance) are left UNSCHEDULED on F (valid == base order) instead of
+  // asserting. a4w4 / a8w8 / a16w16 schedule + verify cleanly so they are scheduled
+  // exactly as before (no behavior change). A real microscale speedup would need a
+  // dependency-preserving (list-scheduler) rewrite; this only guarantees validity.
+  {
+    llvm::ValueToValueMapTy VMap;
+    llvm::Function *Clone = llvm::CloneFunction(&F, VMap);
+    {
+      llvm::legacy::FunctionPassManager FPM(Clone->getParent());
+      FPM.add(new LLIRSchedulePass(arch));
+      FPM.doInitialization();
+      FPM.run(*Clone);
+      FPM.doFinalization();
+    }
+    bool valid = !llvm::verifyFunction(*Clone);
+    Clone->eraseFromParent();
+    if (!valid)
+      return; // leave F unscheduled (valid base order)
+  }
+
   llvm::legacy::FunctionPassManager FPM(F.getParent());
   FPM.add(new LLIRSchedulePass(arch));
   FPM.doInitialization();
